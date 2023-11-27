@@ -19,6 +19,12 @@ import sys
 import subprocess
 import pymysql
 import configparser
+from flask import Flask, jsonify
+import requests
+
+AWS_SERVER_IP = "43.202.187.77"
+AWS_SERVER_PORT = "5000"
+
 
 config = configparser.ConfigParser()
 config.read('config.ini')
@@ -26,22 +32,28 @@ config.read('config.ini')
 sms_send_lock = threading.Lock()
 
 RDS_HOST = config.get('DATABASE', 'HOST')
-RDS_PORT = config.getint('DATABASE', 'PORT')  # 정수로 변환
+RDS_PORT = config.getint('DATABASE', 'PORT')
 RDS_USER = config.get('DATABASE', 'USER')
 RDS_PASSWORD = config.get('DATABASE', 'PASSWORD')
 RDS_DB = config.get('DATABASE', 'DB_NAME')
 RDS_CHARSET = config.get('DATABASE', 'CHARSET')
 
-# 데이터베이스 연결
-db = pymysql.connect(
-    host=RDS_HOST,
-    port=RDS_PORT,
-    user=RDS_USER,
-    passwd=RDS_PASSWORD,
-    db=RDS_DB,
-    charset=RDS_CHARSET
-)
-cursor = db.cursor()
+def execute_query(query, args=None):
+    connection = pymysql.connect(
+        host=RDS_HOST,
+        port=RDS_PORT,
+        user=RDS_USER,
+        passwd=RDS_PASSWORD,
+        db=RDS_DB,
+        charset=RDS_CHARSET
+    )
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(query, args)
+            result = cursor.fetchall()
+        return result
+    finally:
+        connection.close()
 
 # Twilio setup
 ACCOUNT_SID = config.get('TWILIO', 'ACCOUNT_SID')
@@ -56,11 +68,11 @@ userfall = False
 messagecount = 0
 last_fall_time = 0
 
-volume_increment = 0.5  # 소리 크기를 10%씩 증가시킵니다.
+volume_increment = 0.5
 max_volume = 1.0
 
 def send_sms(phone_number, message):
-    formatted_phone_number = "+82" + phone_number[1:]  # '0'을 제거하고 '+82'를 추가
+    formatted_phone_number = "+82" + phone_number[1:]
     client.messages.create(
         body=message,
         from_=TWILIO_PHONE,
@@ -73,44 +85,37 @@ def send_fall_detection_alert():
         global userfall, messagecount, last_sms_time
         print("Starting SMS alert")
 
-        # emergency 테이블에서 emergencycall 번호 가져오기
-        cursor.execute("SELECT emergencycall FROM emergency")
-        emergency_numbers = [row[0] for row in cursor.fetchall()]
+        emergency_numbers = execute_query("SELECT emergencycall FROM emergency")
+        emergency_numbers = [row[0] for row in emergency_numbers]
 
-        # member 테이블에서 필요한 정보 가져오기
-        cursor.execute("SELECT memberAD, memberphone, alertphonenumber1, alertphonenumber2, alertphonenumber3 FROM member WHERE camerid = '1'")
-        member_info = cursor.fetchall()
+        member_info = execute_query(
+            "SELECT memberAD, memberphone, alertphonenumber1, alertphonenumber2, alertphonenumber3 FROM member WHERE cameraid = '1'")
 
-        emergency_sent = False  # emergency 번호로 문자를 보냈는지 확인하는 플래그
+        emergency_sent = False
 
         while userfall:
-            # Check if it's been more than 15 seconds since the last message
             if time.time() - last_sms_time >= 15:
-                # emergency 번호로 문자 보내기 (한 번만)
                 if not emergency_sent:
                     for number in emergency_numbers:
                         send_sms(number, "낙상발생")
                     emergency_sent = True
 
-                # member 번호로 문자 보내기
                 for memberAD, memberphone, alertphonenumber1, alertphonenumber2, alertphonenumber3 in member_info:
                     message = f"낙상발생\n{memberAD} 에서 낙상이 발생했습니다.\n보호자번호 : {memberphone}으로 연락주세요."
-                    if memberphone:  # memberphone이 빈 문자열이 아니면
+                    if memberphone:
                         send_sms(memberphone, message)
-                    if alertphonenumber1:  # alertphonenumber1이 빈 문자열이 아니면
+                    if alertphonenumber1:
                         send_sms(alertphonenumber1, message)
-                    if alertphonenumber2:  # alertphonenumber2이 빈 문자열이 아니면
+                    if alertphonenumber2:
                         send_sms(alertphonenumber2, message)
-                    if alertphonenumber3:  # alertphonenumber3이 빈 문자열이 아니면
+                    if alertphonenumber3:
                         send_sms(alertphonenumber3, message)
 
-                print("SMS sent.")  # 문자 전송 문구
-                # Update the last_sms_time and messagecount
+                print("SMS sent.")
                 last_sms_time = time.time()
                 messagecount += 1
             time.sleep(1)
 
-        # 낙상상태 해제 문자 보내기
         for memberAD, memberphone, alertphonenumber1, alertphonenumber2, alertphonenumber3 in member_info:
             message = f"낙상상태 해제\n{memberAD} 에서 사용자가 낙상상태에서 벗어나 정상적으로 활동중입니다."
             if memberphone:
@@ -122,7 +127,6 @@ def send_fall_detection_alert():
             if alertphonenumber3:
                 send_sms(alertphonenumber3, message)
 
-            # emergency 번호로 낙상상태 해제 문자 보내기
         for number in emergency_numbers:
             if number:
                 send_sms(number, "낙상상태 해제")
@@ -139,9 +143,8 @@ def play_alert_sound():
 
     while userfall:
         pygame.mixer.music.play()
-        time.sleep(10)  # 10초 대기
+        time.sleep(10)
 
-        # 볼륨 증가
         current_volume += volume_increment
         if current_volume > max_volume:
             current_volume = max_volume
@@ -149,6 +152,19 @@ def play_alert_sound():
 
     pygame.mixer.music.stop()
     print("Alert sound ended.")
+
+def update_fall_status_on_server(fall_status):
+    url = f"http://{AWS_SERVER_IP}:{AWS_SERVER_PORT}/fall_status"
+    data = {"fall_status": fall_status}
+    try:
+        response = requests.post(url, json=data)
+        if response.status_code == 200:
+            print("Fall status updated successfully on server")
+        else:
+            print("Failed to update fall status on server")
+    except Exception as e:
+        print(f"Error updating fall status on server: {str(e)}")
+
 
 @torch.no_grad()
 def run(poseweights='yolov7-w6-pose', source='0', device='cpu'):
@@ -167,6 +183,7 @@ def run(poseweights='yolov7-w6-pose', source='0', device='cpu'):
         cap = cv2.VideoCapture(video_path)
 
     cv2.namedWindow("Webcam", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Webcam", 960, 540)
 
     frame_count, total_fps = 0, 0
     acceleration_calculator = AccelerationCalculator()
@@ -205,25 +222,25 @@ def run(poseweights='yolov7-w6-pose', source='0', device='cpu'):
                 plot_skeleton_kpts(img, kpts, 3)
                 xmin, ymin = (output[idx, 2] - output[idx, 4] / 2), (output[idx, 3] - output[idx, 5] / 2)
                 xmax, ymax = (output[idx, 2] + output[idx, 4] / 2), (output[idx, 3] + output[idx, 5] / 2)
-                p1 = (int(xmin), int(ymin))
-                p2 = (int(xmax), int(ymax))
                 difference = int(ymax) - int(ymin) - (int(xmax) - int(xmin))
                 ph = Get_coord(kpts, 2)
 
-                if ((difference < 0) and (int(ph) > thre)) or (difference < 0) and acceleration > 500:
-                    cv2.rectangle(img, p1, p2, (0, 255, 0), 3)
+                if ((difference < 0) and (int(ph) > thre)) or (difference < 0) and acceleration > 1500:
+                    cv2.rectangle(img, (int(xmin), int(ymin)), (int(xmax), int(ymax)), (0, 255, 0), 3)
                     if not userfall:
-                        if last_fall_time == 0:  # 처음으로 바운딩 박스가 감지된 경우
+                        if last_fall_time == 0:
                             last_fall_time = time.time()
-                        elif time.time() - last_fall_time >= 15:  # 바운딩 박스가 15초 동안 지속된 경우
+                        elif time.time() - last_fall_time >= 15:
                             userfall = True
+                            update_fall_status_on_server(True)
                             last_fall_time = time.time()
                             threading.Thread(target=send_fall_detection_alert).start()
-                            threading.Thread(target=play_alert_sound).start()  # 경고음 재생 시작
+                            threading.Thread(target=play_alert_sound).start()
                 else:
-                    last_fall_time = 0  # 바운딩 박스가 없는 경우 시간을 리셋
+
                     if userfall:
                         userfall = False
+                        update_fall_status_on_server(False)
                         messagecount = 0
 
             img_ = img.copy()
@@ -234,7 +251,7 @@ def run(poseweights='yolov7-w6-pose', source='0', device='cpu'):
             total_fps += fps
             frame_count += 1
 
-            if time.time() - last_print_time >= 3:  # 3초마다 출력
+            if time.time() - last_print_time >= 3:
                 fall_status = "Fall detected" if userfall else "No fall"
                 print(f"{fall_status}, FPS: {fps:.2f}")
                 last_print_time = time.time()
@@ -251,19 +268,15 @@ def run(poseweights='yolov7-w6-pose', source='0', device='cpu'):
 
 
 
-def parse_opt():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--poseweights', nargs='+', type=str, default='yolov7-w6-pose.pt', help='model path(s)')
-    parser.add_argument('--source', type=str, default='0', help='video/0 for webcam')
-    parser.add_argument('--device', type=str, default='cpu', help='cpu/0,1,2,3(gpu)')
-    opt = parser.parse_args()
-    return opt
-
-
 if __name__ == "__main__":
     try:
-        opt = parse_opt()
-        strip_optimizer(opt.device, opt.poseweights)
-        run(**vars(opt))
-    finally:
-        db.close()
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--poseweights', nargs='+', type=str, default='yolov7-w6-pose.pt', help='model path(s)')
+        parser.add_argument('--source', type=str, default='0', help='video/0 for webcam')
+        parser.add_argument('--device', type=str, default='cpu', help='cpu/0,1,2,3(gpu)')
+        args = parser.parse_args()
+
+        strip_optimizer(args.device, args.poseweights)
+        run(**vars(args))
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
